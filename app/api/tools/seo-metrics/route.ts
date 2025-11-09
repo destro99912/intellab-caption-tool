@@ -1,9 +1,26 @@
 import { NextResponse } from "next/server";
 
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+/** CORS helpers */
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+function jsonWithCors(data: unknown, init?: ResponseInit) {
+  return new NextResponse(JSON.stringify(data), {
+    status: init?.status ?? 200,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...(init?.headers || {}) },
+  });
+}
+
 type ReqBody = {
   terms: string[];
-  country?: string;   // "US", "AE", etc (we map to location_code outside or via a helper)
-  lang?: string;      // "en", "ar", etc.
+  country?: string; // "US", "AE", etc (we map to location_code outside or via a helper)
+  lang?: string; // "en", "ar", etc.
 };
 
 // Minimal location map. Expand as needed.
@@ -16,12 +33,20 @@ const LOCATION_CODES: Record<string, number> = {
   // add more if you need
 };
 
+/** Handle preflight (and harmless on same-origin) */
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
+}
+
 export async function POST(req: Request) {
   try {
-    const { terms, country = "US", lang = "en" } = (await req.json()) as ReqBody;
+    const body = (await req.json()) as ReqBody;
+    const terms = body?.terms;
+    const country = body?.country ?? "US";
+    const lang = body?.lang ?? "en";
 
     if (!Array.isArray(terms) || terms.length === 0) {
-      return NextResponse.json({ error: "terms must be a non-empty string array" }, { status: 400 });
+      return jsonWithCors({ error: "terms must be a non-empty string array" }, { status: 400 });
     }
 
     const location_code = LOCATION_CODES[country] ?? LOCATION_CODES.US;
@@ -29,9 +54,9 @@ export async function POST(req: Request) {
     // DataForSEO expects an array of tasks in the body
     const payload = [
       {
-        keywords: terms,            // IMPORTANT: array of strings
-        location_code,              // e.g., 2840 for US
-        language_code: lang,        // "en"
+        keywords: terms, // IMPORTANT: array of strings
+        location_code, // e.g., 2840 for US
+        language_code: lang, // "en"
         sort_by: "relevance",
       },
     ];
@@ -39,17 +64,29 @@ export async function POST(req: Request) {
     const login = process.env.DATAFORSEO_LOGIN!;
     const password = process.env.DATAFORSEO_PASSWORD!;
     if (!login || !password) {
-      return NextResponse.json({ error: "DataForSEO credentials missing" }, { status: 500 });
+      return jsonWithCors({ error: "DataForSEO credentials missing" }, { status: 500 });
     }
 
-    const res = await fetch("https://api.dataforseo.com/v3/keywords_data/google_ads/search_volume/live", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Basic " + Buffer.from(`${login}:${password}`).toString("base64"),
-      },
-      body: JSON.stringify(payload),
-    });
+    const res = await fetch(
+      "https://api.dataforseo.com/v3/keywords_data/google_ads/search_volume/live",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Basic " + Buffer.from(`${login}:${password}`).toString("base64"),
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    // Surface upstream errors with text to help debugging
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      return jsonWithCors(
+        { error: "Upstream DataForSEO error", status: res.status, body: txt },
+        { status: 502 }
+      );
+    }
 
     const data = await res.json();
 
@@ -83,9 +120,9 @@ export async function POST(req: Request) {
       items,
     };
 
-    return NextResponse.json(response);
+    return jsonWithCors(response);
   } catch (err: any) {
     console.error("seo-metrics error:", err);
-    return NextResponse.json({ error: err?.message ?? "Unknown error" }, { status: 500 });
+    return jsonWithCors({ error: err?.message ?? "Unknown error" }, { status: 500 });
   }
 }
