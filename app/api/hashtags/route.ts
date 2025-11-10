@@ -1,217 +1,199 @@
 // app/api/hashtags/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
-export const runtime = "nodejs"; // use node runtime for server-side SDKs / longer fetch timeouts
+export const runtime = "nodejs"; // edge can't use fetch streaming reliably for big datasets
 
-const ALLOWED_PLATFORMS = new Set(["instagram", "tiktok", "youtube", "facebook"]);
+const ALLOWED_PLATFORMS = new Set(["instagram"]);
+const DEFAULT_LIMIT = 20;
 
-type Agg = {
-  posts: number;
-  likesSum: number;
-  commentsSum: number;
-  likesN: number;
-  commentsN: number;
+// --- helpers ---------------------------------------------------------------
+const getEnv = (k: string) => process.env[k]?.trim() || "";
+
+function norm(s: string) {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^\p{L}\p{N}\s#_]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+type ApifyItem = {
+  url?: string;
+  imageUrl?: string | null;
+  caption?: string | null;
+  likes?: number | null;
+  comments?: number | null;
+  ownerUsername?: string | null;
+  hashtags?: string[] | null; // some datasets expose an array
+  location?: { city?: string | null; country?: string | null } | null;
+  lang?: string | null;
 };
 
-// Helper: build Apify dataset items URL from datasetId + token
-function apifyDatasetUrl(datasetId: string, token: string, limit = 200, offset = 0) {
-  const base = `https://api.apify.com/v2/datasets/${encodeURIComponent(datasetId)}/items`;
-  const params = new URLSearchParams({ token, clean: "true", format: "json", limit: String(limit), offset: String(offset) });
-  return `${base}?${params.toString()}`;
+// find tags in a caption text
+function extractTagsFromCaption(caption: string): string[] {
+  const tags = new Set<string>();
+  const rx = /#([\p{L}\p{N}_]+)/gu;
+  let m;
+  while ((m = rx.exec(caption))) tags.add(m[1].toLowerCase());
+  return [...tags];
 }
 
-// Helper: try multiple known shapes to extract a numeric metric
-function extractNumber(shape: any, keys: string[]) {
-  for (const k of keys) {
-    const v = shape?.[k];
-    if (typeof v === "number" && !Number.isNaN(v)) return v;
-    if (typeof v === "string" && v.trim() !== "") {
-      const n = Number(v.replace(/[^0-9.-]/g, ""));
-      if (!Number.isNaN(n)) return n;
-    }
-    // deep path like 'edge_media_preview_like.count'
-    if (k.includes(".")) {
-      const parts = k.split(".");
-      let cur = shape;
-      for (const p of parts) cur = cur?.[p];
-      if (typeof cur === "number" && !Number.isNaN(cur)) return cur;
-    }
-  }
-  return null;
+function pickImage(it: ApifyItem) {
+  return it.imageUrl || null;
 }
 
+function likeNum(n: unknown) {
+  return typeof n === "number" && isFinite(n) ? n : 0;
+}
+function comNum(n: unknown) {
+  return typeof n === "number" && isFinite(n) ? n : 0;
+}
+
+// --- route ----------------------------------------------------------------
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);
-  const q = (url.searchParams.get("q") || "").trim();
-  let platformParam = (url.searchParams.get("platform") || "instagram").toLowerCase();
-  const platform = ALLOWED_PLATFORMS.has(platformParam) ? platformParam : platformParam;
-  const count = Math.max(1, Math.min(Number(url.searchParams.get("count") || "20"), 200));
-  const sample = Math.max(50, Math.min(Number(url.searchParams.get("sample") || String(count * 10)), 5000));
+  const qRaw = (url.searchParams.get("q") || "").trim();
+  const q = norm(qRaw);
+  const region = (url.searchParams.get("region") || "global").toLowerCase();
+  const lang = (url.searchParams.get("lang") || "").toLowerCase();
+  const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit") || url.searchParams.get("count")) || DEFAULT_LIMIT, 100));
+  const platformParam = (url.searchParams.get("platform") || "instagram").toLowerCase();
+  const platform = ALLOWED_PLATFORMS.has(platformParam) ? platformParam : "instagram";
 
-  if (!q) {
-    return NextResponse.json({ error: true, message: "Missing query param 'q'" }, { status: 400 });
+  // env checks
+  const DATASET_ID = getEnv("APIFY_DATASET_ID");
+  const APIFY_TOKEN = getEnv("APIFY_TOKEN");
+  if (!DATASET_ID || !APIFY_TOKEN) {
+    return NextResponse.json(
+      { error: true, message: "APIFY_DATASET_ID and APIFY_TOKEN must be configured", provider: "none" },
+      { status: 500 }
+    );
   }
 
-  // Currently only Instagram via Apify is implemented
-  if (platform !== "instagram") {
-    return NextResponse.json({
-      error: true,
-      message: `Platform '${platform}' not implemented. Only 'instagram' is supported at this time.`,
-      provider: "none",
-    }, { status: 501 });
+  // fetch raw items (we fetch more than needed, then filter)
+  const apifyUrl = new URL(`https://api.apify.com/v2/datasets/${DATASET_ID}/items`);
+  apifyUrl.searchParams.set("token", APIFY_TOKEN);
+  apifyUrl.searchParams.set("clean", "true");
+  apifyUrl.searchParams.set("format", "json");
+  apifyUrl.searchParams.set("limit", "1000"); // pull a page for server-side filtering
+  apifyUrl.searchParams.set("skipHidden", "true");
+
+  const res = await fetch(apifyUrl.toString(), { headers: { "accept": "application/json" }, cache: "no-store" });
+  if (!res.ok) {
+    return NextResponse.json(
+      { error: true, message: `Upstream error ${res.status}`, provider: "apify" },
+      { status: 502 }
+    );
   }
+  const raw: ApifyItem[] = await res.json();
 
-  // Read env-driven dataset config
-  const datasetId = process.env.APIFY_DATASET_ID || url.searchParams.get("datasetId") || null;
-  const token = process.env.APIFY_TOKEN || null;
+  // --- filtering & mapping -------------------------------------------------
+  const qWords = q ? q.split(" ") : [];
+  const matchesQuery = (it: ApifyItem) => {
+    if (!q) return true;
+    const caption = norm(it.caption || "");
+    const tags = (it.hashtags ?? extractTagsFromCaption(caption)).map((t) => t.toLowerCase());
+    // match if any qWord equals a tag OR appears in caption with a preceding '#'
+    return qWords.some(
+      (w) => tags.includes(w) || caption.includes(`#${w}`) || caption.split(/\s+/).includes(w)
+    );
+  };
 
-  if (!datasetId || !token) {
-    return NextResponse.json({ error: true, message: "APIFY_DATASET_ID and APIFY_TOKEN must be configured", provider: "none" }, { status: 500 });
-  }
+  const matchesRegion = (it: ApifyItem) => {
+    if (region === "global") return true;
+    const city = norm(it.location?.city || "");
+    const country = norm(it.location?.country || "");
+    return city.includes(region) || country.includes(region);
+  };
 
-  // Fetch with timeout + simple retry/backoff
-  const pageLimit = 200; // Apify dataset page size
-  const maxPages = Math.ceil(sample / pageLimit);
-  const needle = q.toLowerCase();
+  const matchesLang = (it: ApifyItem) => {
+    if (!lang) return true;
+    return (it.lang || "").toLowerCase() === lang;
+  };
 
-  const matchedPosts: any[] = [];
+  const filtered = raw.filter((it) => matchesQuery(it) && matchesRegion(it) && matchesLang(it));
 
-  const controller = new AbortController();
-  const timeoutMs = 10000;
+  // tally by tag
+  type Bucket = {
+    tag: string;
+    count: number;
+    totalLikes: number;
+    totalComments: number;
+    samples: number;
+    samplePosts: {
+      url: string | undefined;
+      imageUrl: string | null;
+      caption: string | null;
+      likes: number;
+      comments: number;
+      ownerUsername: string | null;
+    }[];
+  };
 
-  try {
-    for (let page = 0; page < maxPages; page++) {
-      const offset = page * pageLimit;
-      const url = apifyDatasetUrl(datasetId, token, pageLimit, offset);
+  const buckets = new Map<string, Bucket>();
 
-      // local fetch with timeout
-      const attemptFetch = async (attempt = 0): Promise<Response> => {
-        const ac = new AbortController();
-        const timer = setTimeout(() => ac.abort(), timeoutMs + attempt * 2000);
-        try {
-          const res = await fetch(url, { signal: ac.signal, cache: "no-store" });
-          if (res.status >= 500 || res.status === 429) {
-            if (attempt < 2) {
-              await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
-              return attemptFetch(attempt + 1);
-            }
-            return res; // will be handled below
-          }
-          return res;
-        } finally {
-          clearTimeout(timer);
-        }
+  for (const it of filtered) {
+    const caption = it.caption || "";
+    const tags = (it.hashtags ?? extractTagsFromCaption(caption)).map((t) => t.toLowerCase());
+    const likes = likeNum(it.likes);
+    const comments = comNum(it.comments);
+
+    for (const tag of tags) {
+      if (!tag) continue;
+      const b = buckets.get(tag) || {
+        tag,
+        count: 0,
+        totalLikes: 0,
+        totalComments: 0,
+        samples: 0,
+        samplePosts: [],
       };
+      b.count += 1;
+      b.totalLikes += likes;
+      b.totalComments += comments;
 
-      const res = await attemptFetch(0);
-      if (!res.ok) {
-        // upstream error -> surface provider unavailable
-        const status = res.status;
-        return NextResponse.json({ error: true, message: "Upstream provider unavailable", provider: "Apify", status }, { status: 502 });
+      if (b.samples < 3) {
+        b.samplePosts.push({
+          url: it.url,
+          imageUrl: pickImage(it),
+          caption: it.caption || null,
+          likes,
+          comments,
+          ownerUsername: it.ownerUsername || null,
+        });
+        b.samples += 1;
       }
-
-      const data = await res.json();
-      if (!Array.isArray(data) || data.length === 0) break;
-
-      for (const post of data) {
-        const caption = String(post?.caption || "").toLowerCase();
-        const tags: string[] = Array.isArray(post?.hashtags) ? post.hashtags : [];
-        const tagHit = tags.some((t) => String(t || "").toLowerCase().includes(needle));
-        if (caption.includes(needle) || tagHit) {
-          matchedPosts.push(post);
-        }
-      }
-
-      // stop early if we already collected enough posts
-      if (matchedPosts.length >= sample) break;
+      buckets.set(tag, b);
     }
-
-    // Normalize & aggregate
-    const map = new Map<string, Agg>();
-    const postsOut: any[] = [];
-
-    for (const post of matchedPosts.slice(0, sample)) {
-      const rawTags: any[] = Array.isArray(post?.hashtags) ? post.hashtags : [];
-
-      const likes = extractNumber(post, ["likesCount", "likes", "like_count", "edge_media_preview_like.count", "edge_liked_by?.count"]);
-      const comments = extractNumber(post, ["commentsCount", "comments", "commentCount", "edge_media_preview_comment.count", "edge_media_to_comment?.count"]);
-
-      // produce normalized post for 'posts' array
-      const normalizedTags: string[] = rawTags
-        .map((t) => String(t || "").trim().replace(/^#/, "").toLowerCase())
-        .filter(Boolean);
-
-      postsOut.push({
-        caption: post?.caption ?? null,
-        hashtags: normalizedTags,
-        url: post?.url ?? post?.permalink ?? null,
-        imageUrl: post?.imageUrl ?? post?.displayUrl ?? post?.thumbnailUrl ?? null,
-        likes: typeof likes === "number" ? likes : null,
-        comments: typeof comments === "number" ? comments : null,
-        ownerUsername: post?.ownerUsername ?? post?.username ?? post?.owner?.username ?? null,
-      });
-
-      // aggregate per normalized tag
-      for (const t of normalizedTags) {
-        const key = t;
-        const cur = map.get(key) || { posts: 0, likesSum: 0, commentsSum: 0, likesN: 0, commentsN: 0 };
-        cur.posts += 1;
-        if (typeof likes === "number") {
-          cur.likesSum += likes;
-          cur.likesN += 1;
-        }
-        if (typeof comments === "number") {
-          cur.commentsSum += comments;
-          cur.commentsN += 1;
-        }
-        map.set(key, cur);
-      }
-    }
-
-    const rows = Array.from(map.entries())
-      .sort((a, b) => b[1].posts - a[1].posts)
-      .slice(0, count)
-      .map(([key, agg]) => {
-        return {
-          hashtag: `#${key}`,
-          posts: agg.posts,
-          avgLikes: agg.likesN ? Math.round(agg.likesSum / agg.likesN) : null,
-          avgComments: agg.commentsN ? Math.round(agg.commentsSum / agg.commentsN) : null,
-        };
-      });
-
-    // summary: average across non-null entries
-    const summary = {
-      totalHashtags: rows.length,
-      totalPosts: rows.reduce((a, r) => a + (r.posts ?? 0), 0),
-      averageLikes:
-        rows.length > 0
-          ? Math.round(
-              rows.reduce((a, r) => a + (r.avgLikes ?? 0), 0) /
-                Math.max(1, rows.filter((r) => r.avgLikes != null).length)
-            )
-          : 0,
-      averageComments:
-        rows.length > 0
-          ? Math.round(
-              rows.reduce((a, r) => a + (r.avgComments ?? 0), 0) /
-                Math.max(1, rows.filter((r) => r.avgComments != null).length)
-            )
-          : 0,
-    };
-
-    return NextResponse.json({
-      query: q,
-      meta: { platform: "instagram", provider: "Apify", datasetId: datasetId },
-      summary,
-      rows,
-      posts: postsOut,
-    });
-  } catch (err: any) {
-    // Avoid leaking secrets; surface a safe message
-    console.error("hashtags route error:", err?.message ?? err);
-    return NextResponse.json({ error: true, message: "Upstream provider unavailable" }, { status: 502 });
-  } finally {
-    controller.abort();
   }
+
+  // rank by frequency then by average likes
+  const ranked = [...buckets.values()]
+    .map((b) => ({
+      tag: b.tag,
+      platform,
+      posts: b.count,
+      avgLikes: b.count ? Math.round(b.totalLikes / b.count) : 0,
+      avgComments: b.count ? Math.round(b.totalComments / b.count) : 0,
+      samples: b.samplePosts,
+    }))
+    .sort((a, b) => (b.posts - a.posts) || (b.avgLikes - a.avgLikes))
+    .slice(0, limit);
+
+  // response summary
+  const summary = {
+    totalPosts: filtered.length,
+    totalTags: buckets.size,
+    averageLikes: ranked.length ? Math.round(ranked.reduce((a, r) => a + r.avgLikes, 0) / ranked.length) : 0,
+    averageComments: ranked.length ? Math.round(ranked.reduce((a, r) => a + r.avgComments, 0) / ranked.length) : 0,
+  };
+
+  return NextResponse.json({
+    ok: true,
+    query: { q: qRaw, region, lang, platform, limit },
+    meta: { provider: "apify", datasetId: DATASET_ID, generatedAt: new Date().toISOString() },
+    summary,
+    items: ranked,
+  });
 }
