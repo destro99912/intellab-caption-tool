@@ -25,6 +25,7 @@ const PLATFORMS = [
   { id: "tiktok", label: "TikTok" },
   { id: "x", label: "X (Twitter)" },
   { id: "youtube", label: "YouTube" },
+  { id: "facebook", label: "Facebook" },
 ];
 
 export default function HashtagGeneratorPage() {
